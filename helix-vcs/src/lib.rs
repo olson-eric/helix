@@ -63,17 +63,26 @@ impl DiffProviderRegistry {
 
     /// Fire-and-forget changed file iteration. Runs everything in a background task. Keeps
     /// iteration until `on_change` returns `false`.
+    ///
+    /// With `include_staged`, changes between `HEAD` and the index (staged
+    /// changes) are reported in addition to index-vs-worktree changes; a
+    /// file changed in both may then be reported twice.
     pub fn for_each_changed_file(
         self,
         cwd: PathBuf,
         trust_full: bool,
+        include_staged: bool,
         f: impl Fn(Result<FileChange>) -> bool + Send + 'static,
     ) {
         tokio::task::spawn_blocking(move || {
             if self
                 .providers
                 .iter()
-                .find_map(|provider| provider.for_each_changed_file(&cwd, trust_full, &f).ok())
+                .find_map(|provider| {
+                    provider
+                        .for_each_changed_file(&cwd, trust_full, include_staged, &f)
+                        .ok()
+                })
                 .is_none()
             {
                 f(Err(anyhow!("no diff provider returns success")));
@@ -131,11 +140,12 @@ impl DiffProvider {
         &self,
         cwd: &Path,
         trust_full: bool,
+        include_staged: bool,
         f: impl Fn(Result<FileChange>) -> bool,
     ) -> Result<()> {
         match self {
             #[cfg(feature = "git")]
-            Self::Git => git::for_each_changed_file(cwd, trust_full, f),
+            Self::Git => git::for_each_changed_file(cwd, trust_full, include_staged, f),
             Self::None => bail!("No diff support compiled in"),
         }
     }

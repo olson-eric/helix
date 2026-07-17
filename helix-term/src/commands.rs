@@ -413,6 +413,7 @@ impl MappableCommand {
         syntax_symbol_picker, "Open symbol picker from syntax information",
         lsp_or_syntax_symbol_picker, "Open symbol picker from LSP or syntax information",
         changed_file_picker, "Open changed file picker",
+        diff_view, "Open diff viewer for workspace changes",
         select_references_to_symbol_under_cursor, "Select symbol references",
         workspace_symbol_picker, "Open workspace symbol picker",
         syntax_workspace_symbol_picker, "Open workspace symbol picker from syntax information",
@@ -3571,7 +3572,7 @@ fn changed_file_picker(cx: &mut Context) {
     cx.editor
         .diff_providers
         .clone()
-        .for_each_changed_file(cwd, trust_full, move |change| match change {
+        .for_each_changed_file(cwd, trust_full, false, move |change| match change {
             Ok(change) => injector.push(change).is_ok(),
             Err(err) => {
                 status::report_blocking(err);
@@ -3579,6 +3580,10 @@ fn changed_file_picker(cx: &mut Context) {
             }
         });
     cx.push_layer(Box::new(overlaid(picker)));
+}
+
+fn diff_view(cx: &mut Context) {
+    ui::diff_viewer::open(cx.editor, cx.jobs);
 }
 
 pub fn command_palette(cx: &mut Context) {

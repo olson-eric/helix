@@ -88,9 +88,14 @@ pub fn get_current_head_name(file: &Path, trust_full: bool) -> Result<Arc<ArcSwa
 pub fn for_each_changed_file(
     cwd: &Path,
     trust_full: bool,
+    include_staged: bool,
     f: impl Fn(Result<FileChange>) -> bool,
 ) -> Result<()> {
-    status(&open_repo(cwd, trust_full)?.to_thread_local(), f)
+    status(
+        &open_repo(cwd, trust_full)?.to_thread_local(),
+        include_staged,
+        f,
+    )
 }
 
 fn open_repo(path: &Path, trust_full: bool) -> Result<ThreadSafeRepository> {
@@ -145,12 +150,22 @@ fn open_repo(path: &Path, trust_full: bool) -> Result<ThreadSafeRepository> {
 }
 
 /// Emulates the result of running `git status` from the command line.
-fn status(repo: &Repository, f: impl Fn(Result<FileChange>) -> bool) -> Result<()> {
+fn status(
+    repo: &Repository,
+    include_staged: bool,
+    f: impl Fn(Result<FileChange>) -> bool,
+) -> Result<()> {
     let work_dir = repo
         .workdir()
         .ok_or_else(|| anyhow::anyhow!("working tree not found"))?
         .to_path_buf();
 
+    let rewrites = Rewrites {
+        copies: None,
+        percentage: Some(0.5),
+        limit: 1000,
+        ..Default::default()
+    };
     let status_platform = repo
         .status(gix::progress::Discard)?
         // Here we discard the `status.showUntrackedFiles` config, as it makes little sense in
@@ -159,64 +174,115 @@ fn status(repo: &Repository, f: impl Fn(Result<FileChange>) -> bool) -> Result<(
         // the feature unusable to many.
         .untracked_files(UntrackedFiles::Files)
         // Turn on file rename detection, which is off by default.
-        .index_worktree_rewrites(Some(Rewrites {
-            copies: None,
-            percentage: Some(0.5),
-            limit: 1000,
-            ..Default::default()
-        }));
+        .index_worktree_rewrites(Some(rewrites));
 
     // No filtering based on path
     let empty_patterns = vec![];
 
-    let status_iter = status_platform.into_index_worktree_iter(empty_patterns)?;
-
-    for item in status_iter {
-        let Ok(item) = item.map_err(|err| f(Err(err.into()))) else {
-            continue;
-        };
-        let change = match item {
-            Item::Modification {
-                rela_path, status, ..
-            } => {
-                let path = work_dir.join(rela_path.to_path()?);
-                match status {
-                    EntryStatus::Conflict { .. } => FileChange::Conflict { path },
-                    EntryStatus::Change(Change::Removed) => FileChange::Deleted { path },
-                    EntryStatus::Change(Change::Modification { .. }) => {
-                        FileChange::Modified { path }
-                    }
-                    // Files marked with `git add --intent-to-add`. Such files
-                    // still show up as new in `git status`, so it's appropriate
-                    // to show them the same way as untracked files in the
-                    // "changed file" picker. One example of this being used
-                    // is Jujutsu, a Git-compatible VCS. It marks all new files
-                    // with `--intent-to-add` automatically.
-                    EntryStatus::IntentToAdd => FileChange::Untracked { path },
-                    _ => continue,
-                }
+    if include_staged {
+        // Also compare `HEAD` against the index, so that staged changes
+        // are reported as well (`git status` semantics rather than only
+        // index-vs-worktree).
+        let status_iter = status_platform
+            .tree_index_track_renames(gix::status::tree_index::TrackRenames::Given(rewrites))
+            .into_iter(empty_patterns)?;
+        for item in status_iter {
+            let Ok(item) = item.map_err(|err| f(Err(err.into()))) else {
+                continue;
+            };
+            let change = match item {
+                gix::status::Item::IndexWorktree(item) => index_worktree_change(&work_dir, item)?,
+                gix::status::Item::TreeIndex(change) => tree_index_change(&work_dir, change)?,
+            };
+            let Some(change) = change else {
+                continue;
+            };
+            if !f(Ok(change)) {
+                break;
             }
-            Item::DirectoryContents { entry, .. } if entry.status == Status::Untracked => {
-                FileChange::Untracked {
-                    path: work_dir.join(entry.rela_path.to_path()?),
-                }
+        }
+    } else {
+        let status_iter = status_platform.into_index_worktree_iter(empty_patterns)?;
+        for item in status_iter {
+            let Ok(item) = item.map_err(|err| f(Err(err.into()))) else {
+                continue;
+            };
+            let Some(change) = index_worktree_change(&work_dir, item)? else {
+                continue;
+            };
+            if !f(Ok(change)) {
+                break;
             }
-            Item::Rewrite {
-                source,
-                dirwalk_entry,
-                ..
-            } => FileChange::Renamed {
-                from_path: work_dir.join(source.rela_path().to_path()?),
-                to_path: work_dir.join(dirwalk_entry.rela_path.to_path()?),
-            },
-            _ => continue,
-        };
-        if !f(Ok(change)) {
-            break;
         }
     }
 
     Ok(())
+}
+
+fn index_worktree_change(work_dir: &Path, item: Item) -> Result<Option<FileChange>> {
+    let change = match item {
+        Item::Modification {
+            rela_path, status, ..
+        } => {
+            let path = work_dir.join(rela_path.to_path()?);
+            match status {
+                EntryStatus::Conflict { .. } => FileChange::Conflict { path },
+                EntryStatus::Change(Change::Removed) => FileChange::Deleted { path },
+                EntryStatus::Change(Change::Modification { .. }) => FileChange::Modified { path },
+                // Files marked with `git add --intent-to-add`. Such files
+                // still show up as new in `git status`, so it's appropriate
+                // to show them the same way as untracked files in the
+                // "changed file" picker. One example of this being used
+                // is Jujutsu, a Git-compatible VCS. It marks all new files
+                // with `--intent-to-add` automatically.
+                EntryStatus::IntentToAdd => FileChange::Untracked { path },
+                _ => return Ok(None),
+            }
+        }
+        Item::DirectoryContents { entry, .. } if entry.status == Status::Untracked => {
+            FileChange::Untracked {
+                path: work_dir.join(entry.rela_path.to_path()?),
+            }
+        }
+        Item::Rewrite {
+            source,
+            dirwalk_entry,
+            ..
+        } => FileChange::Renamed {
+            from_path: work_dir.join(source.rela_path().to_path()?),
+            to_path: work_dir.join(dirwalk_entry.rela_path.to_path()?),
+        },
+        _ => return Ok(None),
+    };
+    Ok(Some(change))
+}
+
+/// Maps a `HEAD`-vs-index (staged) change.
+fn tree_index_change(
+    work_dir: &Path,
+    change: gix::diff::index::Change,
+) -> Result<Option<FileChange>> {
+    use gix::diff::index::ChangeRef;
+    let change = match change {
+        ChangeRef::Addition { location, .. } => FileChange::Untracked {
+            path: work_dir.join(location.to_path()?),
+        },
+        ChangeRef::Deletion { location, .. } => FileChange::Deleted {
+            path: work_dir.join(location.to_path()?),
+        },
+        ChangeRef::Modification { location, .. } => FileChange::Modified {
+            path: work_dir.join(location.to_path()?),
+        },
+        ChangeRef::Rewrite {
+            source_location,
+            location,
+            ..
+        } => FileChange::Renamed {
+            from_path: work_dir.join(source_location.to_path()?),
+            to_path: work_dir.join(location.to_path()?),
+        },
+    };
+    Ok(Some(change))
 }
 
 /// Finds the object that contains the contents of a file at a specific commit.

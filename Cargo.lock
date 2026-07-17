@@ -1690,6 +1690,7 @@ dependencies = [
  "helix-vcs",
  "helix-view",
  "ignore",
+ "imara-diff",
  "indexmap",
  "indoc",
  "libc",
