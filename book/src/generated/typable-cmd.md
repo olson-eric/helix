@@ -78,7 +78,7 @@
 | `:sort` | Sort ranges in selection. |
 | `:reflow` | Hard-wrap the current selection of lines to a given width. |
 | `:tree-sitter-subtree`, `:ts-subtree` | Display the smallest tree-sitter subtree that spans the primary selection, primarily for debugging queries. |
-| `:diff`, `:diff-view` | Open a GitHub-style diff viewer showing all workspace changes against HEAD. |
+| `:diff`, `:diff-view` | Open a GitHub-style diff viewer showing all workspace changes against HEAD, or against the merge base of a given revision (`:diff master`, like a pull-request view). |
 | `:config-reload` | Refresh user config. |
 | `:config-open` | Open the user config.toml file. |
 | `:config-open-workspace` | Open the workspace config.toml file. |

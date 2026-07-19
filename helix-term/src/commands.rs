@@ -3569,21 +3569,23 @@ fn changed_file_picker(cx: &mut Context) {
             helix_loader::workspace_trust::TrustQuery::Git,
         )
         .is_trusted();
-    cx.editor
-        .diff_providers
-        .clone()
-        .for_each_changed_file(cwd, trust_full, false, move |change| match change {
+    cx.editor.diff_providers.clone().for_each_changed_file(
+        cwd,
+        trust_full,
+        helix_vcs::StatusScope::IndexToWorktree,
+        move |change| match change {
             Ok(change) => injector.push(change).is_ok(),
             Err(err) => {
                 status::report_blocking(err);
                 true
             }
-        });
+        },
+    );
     cx.push_layer(Box::new(overlaid(picker)));
 }
 
 fn diff_view(cx: &mut Context) {
-    ui::diff_viewer::open(cx.editor, cx.jobs);
+    ui::diff_viewer::open(cx.editor, cx.jobs, None);
 }
 
 pub fn command_palette(cx: &mut Context) {

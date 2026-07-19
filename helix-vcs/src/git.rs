@@ -17,7 +17,7 @@ use gix::status::{
 };
 use gix::{Commit, ObjectId, Repository, ThreadSafeRepository};
 
-use crate::FileChange;
+use crate::{FileChange, StatusScope};
 
 #[cfg(test)]
 mod test;
@@ -28,6 +28,37 @@ fn get_repo_dir(file: &Path) -> Result<&Path> {
 }
 
 pub fn get_diff_base(file: &Path, trust_full: bool) -> Result<Vec<u8>> {
+    get_diff_base_impl(file, None, trust_full)
+}
+
+/// Like [`get_diff_base`], but reads the file as of the merge base of `rev`
+/// and `HEAD` (`git diff <rev>...` semantics) instead of `HEAD` itself.
+pub fn get_diff_base_at(file: &Path, rev: &str, trust_full: bool) -> Result<Vec<u8>> {
+    get_diff_base_impl(file, Some(rev), trust_full)
+}
+
+/// The commit a diff is computed against: `HEAD`, or for a given revision
+/// the merge base of that revision and `HEAD`, mirroring the "three dot"
+/// (`git diff <rev>...`) semantics used by pull-request views.
+fn base_commit<'a>(repo: &'a Repository, rev: Option<&str>) -> Result<Commit<'a>> {
+    let head = repo.head_commit()?;
+    let Some(rev) = rev else {
+        return Ok(head);
+    };
+    let commit = repo
+        .rev_parse_single(rev)
+        .with_context(|| format!("cannot resolve revision '{rev}'"))?
+        .object()?
+        .peel_to_kind(gix::object::Kind::Commit)
+        .with_context(|| format!("revision '{rev}' does not point to a commit"))?
+        .into_commit();
+    let base_id = repo
+        .merge_base(commit.id, head.id)
+        .with_context(|| format!("no merge base between '{rev}' and HEAD"))?;
+    Ok(base_id.object()?.try_into_commit()?)
+}
+
+fn get_diff_base_impl(file: &Path, rev: Option<&str>, trust_full: bool) -> Result<Vec<u8>> {
     debug_assert!(!file.exists() || file.is_file());
     debug_assert!(file.is_absolute());
     let file = gix::path::realpath(file).context("resolve symlinks")?;
@@ -38,8 +69,8 @@ pub fn get_diff_base(file: &Path, trust_full: bool) -> Result<Vec<u8>> {
     let repo = open_repo(repo_dir, trust_full)
         .context("failed to open git repo")?
         .to_thread_local();
-    let head = repo.head_commit()?;
-    let file_oid = find_file_in_commit(&repo, &head, &file)?;
+    let base = base_commit(&repo, rev)?;
+    let file_oid = find_file_in_commit(&repo, &base, &file)?;
 
     let file_object = repo.find_object(file_oid)?;
     let data = file_object.detach().data;
@@ -88,14 +119,10 @@ pub fn get_current_head_name(file: &Path, trust_full: bool) -> Result<Arc<ArcSwa
 pub fn for_each_changed_file(
     cwd: &Path,
     trust_full: bool,
-    include_staged: bool,
+    scope: &StatusScope,
     f: impl Fn(Result<FileChange>) -> bool,
 ) -> Result<()> {
-    status(
-        &open_repo(cwd, trust_full)?.to_thread_local(),
-        include_staged,
-        f,
-    )
+    status(&open_repo(cwd, trust_full)?.to_thread_local(), scope, f)
 }
 
 fn open_repo(path: &Path, trust_full: bool) -> Result<ThreadSafeRepository> {
@@ -152,7 +179,7 @@ fn open_repo(path: &Path, trust_full: bool) -> Result<ThreadSafeRepository> {
 /// Emulates the result of running `git status` from the command line.
 fn status(
     repo: &Repository,
-    include_staged: bool,
+    scope: &StatusScope,
     f: impl Fn(Result<FileChange>) -> bool,
 ) -> Result<()> {
     let work_dir = repo
@@ -179,13 +206,26 @@ fn status(
     // No filtering based on path
     let empty_patterns = vec![];
 
-    if include_staged {
-        // Also compare `HEAD` against the index, so that staged changes
-        // are reported as well (`git status` semantics rather than only
-        // index-vs-worktree).
-        let status_iter = status_platform
-            .tree_index_track_renames(gix::status::tree_index::TrackRenames::Given(rewrites))
-            .into_iter(empty_patterns)?;
+    if let StatusScope::HeadToWorktree | StatusScope::MergeBaseToWorktree(_) = scope {
+        // Also compare a base tree against the index, so that staged (and,
+        // for a revision base, committed) changes are reported as well
+        // rather than only index-vs-worktree ones.
+        let mut status_platform = status_platform
+            .tree_index_track_renames(gix::status::tree_index::TrackRenames::Given(rewrites));
+        if let StatusScope::MergeBaseToWorktree(rev) = scope {
+            let base = match base_commit(repo, Some(rev)) {
+                Ok(base) => base,
+                Err(err) => {
+                    // Report the resolution failure to the callback rather
+                    // than failing the provider, so the message reaches the
+                    // user instead of a generic "no provider" error.
+                    f(Err(err));
+                    return Ok(());
+                }
+            };
+            status_platform = status_platform.head_tree(base.tree_id()?.detach());
+        }
+        let status_iter = status_platform.into_iter(empty_patterns)?;
         for item in status_iter {
             let Ok(item) = item.map_err(|err| f(Err(err.into()))) else {
                 continue;

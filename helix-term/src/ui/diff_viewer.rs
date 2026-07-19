@@ -16,7 +16,7 @@ use imara_diff::{Algorithm, IndentHeuristic, IndentLevel, InternedInput, Interne
 
 use helix_core::unicode::width::UnicodeWidthChar;
 use helix_core::Selection;
-use helix_vcs::{DiffProviderRegistry, FileChange};
+use helix_vcs::{DiffProviderRegistry, FileChange, StatusScope};
 use helix_view::{
     align_view,
     editor::Action,
@@ -390,6 +390,7 @@ fn build_file_diff(
     change: FileChange,
     trust_full: bool,
     ignore_whitespace: bool,
+    rev: Option<&str>,
 ) -> FileDiff {
     let (status, old_path, path) = match change {
         FileChange::Untracked { path } => (FileStatus::Added, None, path),
@@ -401,10 +402,14 @@ fn build_file_diff(
         }
     };
 
-    let old_bytes = match status {
-        FileStatus::Added => Vec::new(),
-        _ => registry
-            .get_diff_base(old_path.as_deref().unwrap_or(&path), trust_full)
+    let base_path = old_path.as_deref().unwrap_or(&path);
+    let old_bytes = match (status, rev) {
+        (FileStatus::Added, _) => Vec::new(),
+        (_, Some(rev)) => registry
+            .get_diff_base_at(base_path, rev, trust_full)
+            .unwrap_or_default(),
+        (_, None) => registry
+            .get_diff_base(base_path, trust_full)
             .unwrap_or_default(),
     };
     let new_bytes = match status {
@@ -499,6 +504,8 @@ pub struct DiffViewer {
     h_scroll: usize,
     split: bool,
     ignore_whitespace: bool,
+    /// Base revision the diff is computed against (`HEAD` when `None`).
+    rev: Option<String>,
     show_help: bool,
     pending: Option<char>,
     /// Line-number gutter width, derived from the largest file.
@@ -510,7 +517,12 @@ pub struct DiffViewer {
 impl DiffViewer {
     pub const ID: &'static str = "diff-viewer";
 
-    pub fn new(files: Vec<FileDiff>, split: bool, ignore_whitespace: bool) -> Self {
+    pub fn new(
+        files: Vec<FileDiff>,
+        split: bool,
+        ignore_whitespace: bool,
+        rev: Option<String>,
+    ) -> Self {
         let max_line = files
             .iter()
             .map(|f| f.old_lines.len().max(f.new_lines.len()))
@@ -526,6 +538,7 @@ impl DiffViewer {
             h_scroll: 0,
             split,
             ignore_whitespace,
+            rev,
             show_help: false,
             pending: None,
             num_width: num_width.max(3),
@@ -829,7 +842,13 @@ impl DiffViewer {
     }
 
     fn reload(&self, cx: &mut Context) -> EventResult {
-        open_with(cx.editor, cx.jobs, self.split, self.ignore_whitespace);
+        open_with(
+            cx.editor,
+            cx.jobs,
+            self.split,
+            self.ignore_whitespace,
+            self.rev.clone(),
+        );
         EventResult::Consumed(None)
     }
 
@@ -935,11 +954,17 @@ impl DiffViewer {
     }
 }
 
-pub fn open(editor: &mut Editor, jobs: &mut Jobs) {
-    open_with(editor, jobs, false, false);
+pub fn open(editor: &mut Editor, jobs: &mut Jobs, rev: Option<String>) {
+    open_with(editor, jobs, false, false, rev);
 }
 
-fn open_with(editor: &mut Editor, jobs: &mut Jobs, split: bool, ignore_whitespace: bool) {
+fn open_with(
+    editor: &mut Editor,
+    jobs: &mut Jobs,
+    split: bool,
+    ignore_whitespace: bool,
+    rev: Option<String>,
+) {
     let cwd = helix_stdx::env::current_working_dir();
     if !cwd.exists() {
         editor.set_error("current working directory does not exist");
@@ -959,6 +984,7 @@ fn open_with(editor: &mut Editor, jobs: &mut Jobs, split: bool, ignore_whitespac
         trust_full,
         split,
         ignore_whitespace,
+        rev,
     ));
 }
 
@@ -968,11 +994,16 @@ async fn gather_diffs(
     trust_full: bool,
     split: bool,
     ignore_whitespace: bool,
+    rev: Option<String>,
 ) -> Result<job::Callback> {
+    let scope = match &rev {
+        Some(rev) => StatusScope::MergeBaseToWorktree(rev.clone()),
+        None => StatusScope::HeadToWorktree,
+    };
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     registry
         .clone()
-        .for_each_changed_file(cwd.clone(), trust_full, true, move |change| {
+        .for_each_changed_file(cwd.clone(), trust_full, scope, move |change| {
             tx.send(change).is_ok()
         });
 
@@ -989,11 +1020,19 @@ async fn gather_diffs(
 
     let files = {
         let cwd = cwd.clone();
+        let rev = rev.clone();
         tokio::task::spawn_blocking(move || {
             let mut files: Vec<FileDiff> = changes
                 .into_iter()
                 .map(|change| {
-                    build_file_diff(&registry, &cwd, change, trust_full, ignore_whitespace)
+                    build_file_diff(
+                        &registry,
+                        &cwd,
+                        change,
+                        trust_full,
+                        ignore_whitespace,
+                        rev.as_deref(),
+                    )
                 })
                 .collect();
             // A file changed both in the index and the worktree is reported
@@ -1023,7 +1062,7 @@ async fn gather_diffs(
             }
             compositor.replace_or_push(
                 DiffViewer::ID,
-                DiffViewer::new(files, split, ignore_whitespace),
+                DiffViewer::new(files, split, ignore_whitespace, rev),
             );
         },
     )))
@@ -1154,12 +1193,17 @@ impl Component for DiffViewer {
             .files
             .iter()
             .fold((0, 0), |(a, d), f| (a + f.additions, d + f.deletions));
+        let base_label = match &self.rev {
+            Some(rev) => format!("{rev}...working tree"),
+            None => "HEAD → working tree".to_string(),
+        };
         let header = format!(
-            " {} changed file{} with {} additions and {} deletions • HEAD → working tree • {} view{}",
+            " {} changed file{} with {} additions and {} deletions • {} • {} view{}",
             self.files.len(),
             if self.files.len() == 1 { "" } else { "s" },
             total_add,
             total_del,
+            base_label,
             if self.split { "split" } else { "unified" },
             if self.ignore_whitespace {
                 " • ignoring whitespace"
