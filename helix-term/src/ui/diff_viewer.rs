@@ -10,17 +10,19 @@
 
 use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::Result;
 use imara_diff::{Algorithm, IndentHeuristic, IndentLevel, InternedInput, Interner};
 
+use helix_core::syntax::{HighlightEvent, Loader, Syntax};
 use helix_core::unicode::width::UnicodeWidthChar;
-use helix_core::Selection;
+use helix_core::{Rope, Selection};
 use helix_vcs::{DiffProviderRegistry, FileChange, StatusScope};
 use helix_view::{
     align_view,
     editor::Action,
-    graphics::{Modifier, Rect, Style},
+    graphics::{Color, Modifier, Rect, Style},
     input::{Event, MouseButton, MouseEvent, MouseEventKind},
     theme::Theme,
     Align, Editor,
@@ -39,6 +41,12 @@ const EXPAND_LINES: usize = 20;
 /// Files with more changed lines than this start out collapsed,
 /// mirroring GitHub's "large diffs are not rendered by default".
 const AUTO_COLLAPSE_CHANGES: usize = 2000;
+/// Files larger than this are not syntax highlighted.
+const MAX_HIGHLIGHT_BYTES: usize = 1024 * 1024;
+
+/// Per display line: syntax highlight spans as line-relative byte ranges
+/// with their (theme-resolved) styles, sorted and non-overlapping.
+type LineHighlights = Vec<Vec<(Range<usize>, Style)>>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileStatus {
@@ -130,6 +138,10 @@ pub struct FileDiff {
     binary: bool,
     old_lines: Vec<String>,
     new_lines: Vec<String>,
+    /// Tree-sitter highlights for the two file versions (`None` when no
+    /// language matched, the grammar is missing or the file is too large).
+    old_highlights: Option<LineHighlights>,
+    new_highlights: Option<LineHighlights>,
     /// Full alignment of the two files, in order.
     ops: Vec<Op>,
     /// Displayed hunks as disjoint, sorted ranges into `ops`
@@ -180,6 +192,20 @@ impl FileDiff {
         self.hunks
             .last()
             .map_or(0, |hunk| self.ops.len() - hunk.end)
+    }
+
+    /// Syntax highlight spans for one line of the old or new file.
+    fn line_spans(&self, old_side: bool, line_idx: usize) -> &[(Range<usize>, Style)] {
+        let highlights = if old_side {
+            &self.old_highlights
+        } else {
+            &self.new_highlights
+        };
+        highlights
+            .as_ref()
+            .and_then(|lines| lines.get(line_idx))
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
     }
 }
 
@@ -376,6 +402,78 @@ fn push_split_rows(rows: &mut Vec<Row>, file_idx: usize, file: &FileDiff, hunk: 
     }
 }
 
+/// Compute tree-sitter highlights for a whole file, resolved against the
+/// current theme, as per-line spans. This is the same highlighting the
+/// editor shows in buffers; it runs on a background thread when the diff
+/// is built.
+fn syntax_highlights(
+    text: &str,
+    path: &Path,
+    loader: &Loader,
+    theme: &Theme,
+) -> Option<LineHighlights> {
+    if text.is_empty() || text.len() > MAX_HIGHLIGHT_BYTES {
+        return None;
+    }
+    let language = loader.language_for_filename(path)?;
+    let rope = Rope::from_str(text);
+    let source = rope.slice(..);
+    let syntax = Syntax::new(source, language, loader).ok()?;
+    let mut highlighter = syntax.highlighter(source, loader, ..);
+
+    let text_style = theme.get("ui.text");
+    let mut result: LineHighlights = vec![Vec::new(); rope.len_lines()];
+    let total = rope.len_bytes() as u32;
+    let mut style = text_style;
+    let mut pos: u32 = 0;
+    loop {
+        let next = highlighter.next_event_offset();
+        let end = if next == u32::MAX {
+            total
+        } else {
+            next.min(total)
+        };
+        if end > pos && style != text_style {
+            push_highlight_span(&mut result, &rope, pos as usize..end as usize, style);
+        }
+        if next == u32::MAX || next >= total {
+            break;
+        }
+        let (event, highlights) = highlighter.advance();
+        let base = match event {
+            HighlightEvent::Refresh => text_style,
+            HighlightEvent::Push => style,
+        };
+        style = highlights.fold(base, |acc, highlight| acc.patch(theme.highlight(highlight)));
+        pos = next;
+    }
+    Some(result)
+}
+
+/// Record a highlight for a byte range of the file, split into per-line,
+/// line-relative spans.
+fn push_highlight_span(
+    result: &mut LineHighlights,
+    rope: &Rope,
+    range: Range<usize>,
+    style: Style,
+) {
+    let mut line = rope.byte_to_line(range.start);
+    while line < result.len() {
+        let line_start = rope.line_to_byte(line);
+        if line_start >= range.end {
+            break;
+        }
+        let line_end = line_start + rope.line(line).len_bytes();
+        let start = range.start.max(line_start) - line_start;
+        let end = range.end.min(line_end) - line_start;
+        if end > start {
+            result[line].push((start..end, style));
+        }
+        line += 1;
+    }
+}
+
 fn looks_binary(bytes: &[u8]) -> bool {
     bytes[..bytes.len().min(8192)].contains(&0)
 }
@@ -384,6 +482,7 @@ fn display_path(path: &Path, cwd: &Path) -> String {
     path.strip_prefix(cwd).unwrap_or(path).display().to_string()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_file_diff(
     registry: &DiffProviderRegistry,
     cwd: &Path,
@@ -391,6 +490,8 @@ fn build_file_diff(
     trust_full: bool,
     ignore_whitespace: bool,
     rev: Option<&str>,
+    loader: &Loader,
+    theme: &Theme,
 ) -> FileDiff {
     let (status, old_path, path) = match change {
         FileChange::Untracked { path } => (FileStatus::Added, None, path),
@@ -418,11 +519,17 @@ fn build_file_diff(
     };
 
     let binary = looks_binary(&old_bytes) || looks_binary(&new_bytes);
+    let mut old_highlights = None;
+    let mut new_highlights = None;
     let (old_lines, new_lines, ops, hunks, additions, deletions) = if binary {
         (Vec::new(), Vec::new(), Vec::new(), Vec::new(), 0, 0)
     } else {
-        let old_lines = split_lines(&String::from_utf8_lossy(&old_bytes));
-        let new_lines = split_lines(&String::from_utf8_lossy(&new_bytes));
+        let old_text = String::from_utf8_lossy(&old_bytes);
+        let new_text = String::from_utf8_lossy(&new_bytes);
+        let old_lines = split_lines(&old_text);
+        let new_lines = split_lines(&new_text);
+        old_highlights = syntax_highlights(&old_text, base_path, loader, theme);
+        new_highlights = syntax_highlights(&new_text, &path, loader, theme);
         let (ops, hunks, additions, deletions) =
             compute_ops(&old_lines, &new_lines, ignore_whitespace);
         (old_lines, new_lines, ops, hunks, additions, deletions)
@@ -436,6 +543,8 @@ fn build_file_diff(
         binary,
         old_lines,
         new_lines,
+        old_highlights,
+        new_highlights,
         ops,
         hunks,
         additions,
@@ -985,9 +1094,12 @@ fn open_with(
         split,
         ignore_whitespace,
         rev,
+        editor.syn_loader.load_full(),
+        editor.theme.clone(),
     ));
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn gather_diffs(
     registry: DiffProviderRegistry,
     cwd: PathBuf,
@@ -995,6 +1107,8 @@ async fn gather_diffs(
     split: bool,
     ignore_whitespace: bool,
     rev: Option<String>,
+    loader: Arc<Loader>,
+    theme: Theme,
 ) -> Result<job::Callback> {
     let scope = match &rev {
         Some(rev) => StatusScope::MergeBaseToWorktree(rev.clone()),
@@ -1032,6 +1146,8 @@ async fn gather_diffs(
                         trust_full,
                         ignore_whitespace,
                         rev.as_deref(),
+                        &loader,
+                        &theme,
                     )
                 })
                 .collect();
@@ -1082,18 +1198,40 @@ struct Styles {
     cursorline: Style,
     cursor: Style,
     separator: Style,
+    /// GitHub-style row background tints for added/removed lines, derived
+    /// by blending the diff colors into the editor background. Only
+    /// available when the theme uses RGB colors; without them changed
+    /// lines fall back to plain diff-colored text.
+    line_bg_plus: Option<Color>,
+    line_bg_minus: Option<Color>,
+    /// Stronger tints marking the intra-line (word diff) ranges.
+    word_bg_plus: Option<Color>,
+    word_bg_minus: Option<Color>,
+}
+
+/// Blend `fg` towards `bg`; `t` is the weight of `bg` (0.0 = pure `fg`).
+fn blend(fg: Color, bg: Color, t: f32) -> Option<Color> {
+    let (Color::Rgb(r1, g1, b1), Color::Rgb(r2, g2, b2)) = (fg, bg) else {
+        return None;
+    };
+    let mix = |a: u8, b: u8| (a as f32 * (1.0 - t) + b as f32 * t).round() as u8;
+    Some(Color::Rgb(mix(r1, r2), mix(g1, g2), mix(b1, b2)))
 }
 
 impl Styles {
     fn new(theme: &Theme) -> Self {
+        let plus = theme.get("diff.plus");
+        let minus = theme.get("diff.minus");
+        let editor_bg = theme.get("ui.background").bg;
+        let tint = |diff: Style, t: f32| -> Option<Color> { blend(diff.fg?, editor_bg?, t) };
         Styles {
             text: theme.get("ui.text"),
             dim: theme
                 .try_get("ui.text.inactive")
                 .unwrap_or_else(|| theme.get("comment")),
             linenr: theme.get("ui.linenr"),
-            plus: theme.get("diff.plus"),
-            minus: theme.get("diff.minus"),
+            plus,
+            minus,
             file_header: theme.get("ui.statusline").add_modifier(Modifier::BOLD),
             hunk_header: theme.get("diff.delta").add_modifier(Modifier::DIM),
             statusline: theme.get("ui.statusline"),
@@ -1102,11 +1240,24 @@ impl Styles {
                 .try_get_exact("ui.cursor")
                 .unwrap_or_else(|| Style::default().add_modifier(Modifier::REVERSED)),
             separator: theme.get("ui.window"),
+            line_bg_plus: tint(plus, 0.85),
+            line_bg_minus: tint(minus, 0.85),
+            word_bg_plus: tint(plus, 0.60),
+            word_bg_minus: tint(minus, 0.60),
         }
     }
 
     fn status(&self, theme: &Theme, status: FileStatus) -> Style {
         theme.get(status.theme_scope()).add_modifier(Modifier::BOLD)
+    }
+
+    /// Row/word background tints for a line kind, if the theme supports them.
+    fn tints(&self, kind: OpKind) -> (Option<Color>, Option<Color>) {
+        match kind {
+            OpKind::Added => (self.line_bg_plus, self.word_bg_plus),
+            OpKind::Removed => (self.line_bg_minus, self.word_bg_minus),
+            OpKind::Context => (None, None),
+        }
     }
 }
 
@@ -1128,22 +1279,35 @@ fn visual_col(line: &str, char_idx: usize) -> usize {
     col
 }
 
+/// How the text of one diff line is styled.
+struct CodeStyle<'a> {
+    /// Style for characters not covered by a syntax span.
+    base: Style,
+    /// Tree-sitter highlight spans for this line (may be empty).
+    spans: &'a [(Range<usize>, Style)],
+    /// Background tint applied to the whole line (added/removed rows).
+    bg: Option<Color>,
+    /// Intra-line changed byte range.
+    hl: Option<&'a Range<usize>>,
+    /// Stronger background for the `hl` range; without one (non-RGB
+    /// themes) the range is emphasized with reverse video instead.
+    word_bg: Option<Color>,
+}
+
 /// Draw one line of code at `(x, y)`, horizontally scrolled by `skip`
-/// visual columns, applying `hl_style` to the `hl` byte range.
-#[allow(clippy::too_many_arguments)]
+/// visual columns.
 fn draw_code_line(
     surface: &mut Surface,
     x: u16,
     y: u16,
     width: usize,
     line: &str,
-    base: Style,
-    hl: Option<&Range<usize>>,
-    hl_style: Style,
+    cs: &CodeStyle,
     skip: usize,
 ) {
     let mut vcol = 0usize;
     let mut byte = 0usize;
+    let mut span_idx = 0usize;
     let mut char_buf = [0u8; 4];
     for ch in line.chars() {
         let w = char_width(ch, vcol);
@@ -1158,11 +1322,24 @@ fn draw_code_line(
         if start >= skip + width {
             break;
         }
-        let style = if hl.is_some_and(|r| r.contains(&ch_byte)) {
-            hl_style
-        } else {
-            base
+
+        // Syntax style for this char, if any (spans are sorted).
+        while span_idx < cs.spans.len() && cs.spans[span_idx].0.end <= ch_byte {
+            span_idx += 1;
+        }
+        let mut style = match cs.spans.get(span_idx) {
+            Some((range, style)) if range.contains(&ch_byte) => *style,
+            _ => cs.base,
         };
+        if cs.hl.is_some_and(|r| r.contains(&ch_byte)) {
+            style = match cs.word_bg {
+                Some(bg) => style.bg(bg),
+                None => style.add_modifier(Modifier::REVERSED),
+            };
+        } else if let Some(bg) = cs.bg {
+            style = style.bg(bg);
+        }
+
         if ch == '\t' || start < skip {
             // Expand tabs; pad wide chars clipped at the left edge.
             for v in start.max(skip)..end.min(skip + width) {
@@ -1585,8 +1762,18 @@ impl DiffViewer {
     ) {
         let file = &self.files[file_idx];
         let op = &file.ops[op_idx];
-        let (marker, style) = self.line_style(op.kind, styles);
+        let (marker, diff_style) = self.line_style(op.kind, styles);
+        let (line_bg, word_bg) = styles.tints(op.kind);
         let w = self.num_width;
+
+        // Tint the whole row first (fills the padding after the text);
+        // drawn cells below carry their own background.
+        if let Some(bg) = line_bg {
+            surface.set_style(
+                Rect::new(inner.x, y, inner.width, 1),
+                Style::default().bg(bg),
+            );
+        }
 
         let old_num = if op.old != NO_LINE {
             format!("{:>w$}", op.old + 1, w = w)
@@ -1599,36 +1786,56 @@ impl DiffViewer {
             " ".repeat(w)
         };
         let gutter = format!("{} {} {} ", old_num, new_num, marker);
-        let (text_x, _) = surface.set_stringn(
-            inner.x,
-            y,
-            &gutter,
-            inner.width as usize,
-            if op.kind == OpKind::Context {
-                styles.linenr
-            } else {
-                style
-            },
-        );
-
-        let line = if op.new != NO_LINE {
-            file.new_lines.get(op.new)
+        let mut gutter_style = if op.kind == OpKind::Context {
+            styles.linenr
         } else {
-            file.old_lines.get(op.old)
+            diff_style
         };
-        if let Some(line) = line {
+        if let Some(bg) = line_bg {
+            gutter_style = gutter_style.bg(bg);
+        }
+        let (text_x, _) =
+            surface.set_stringn(inner.x, y, &gutter, inner.width as usize, gutter_style);
+
+        let old_side = op.new == NO_LINE;
+        let (line_idx, lines) = if old_side {
+            (op.old, &file.old_lines)
+        } else {
+            (op.new, &file.new_lines)
+        };
+        if let Some(line) = lines.get(line_idx) {
             let width = (inner.right().saturating_sub(text_x)) as usize;
-            draw_code_line(
-                surface,
-                text_x,
-                y,
-                width,
-                line,
-                style,
-                op.hl.as_ref(),
-                style.add_modifier(Modifier::REVERSED),
-                self.h_scroll,
-            );
+            let cs = self.code_style(file, op, old_side, line_idx, line_bg, word_bg, styles);
+            draw_code_line(surface, text_x, y, width, line, &cs, self.h_scroll);
+        }
+    }
+
+    /// Decide how the text of a diff line is styled: syntax highlighting
+    /// with a background tint on truecolor themes, plain diff-colored text
+    /// otherwise (where a syntax-colored line would lose the +/- signal).
+    #[allow(clippy::too_many_arguments)]
+    fn code_style<'a>(
+        &self,
+        file: &'a FileDiff,
+        op: &'a Op,
+        old_side: bool,
+        line_idx: usize,
+        line_bg: Option<Color>,
+        word_bg: Option<Color>,
+        styles: &Styles,
+    ) -> CodeStyle<'a> {
+        let changed = op.kind != OpKind::Context;
+        let (base, spans) = if changed && line_bg.is_none() {
+            (self.line_style(op.kind, styles).1, &[][..])
+        } else {
+            (styles.text, file.line_spans(old_side, line_idx))
+        };
+        CodeStyle {
+            base,
+            spans,
+            bg: line_bg,
+            hl: op.hl.as_ref(),
+            word_bg,
         }
     }
 
@@ -1661,32 +1868,25 @@ impl DiffViewer {
             if line_idx == NO_LINE {
                 return;
             }
-            let (marker, style) = self.line_style(op.kind, styles);
+            let (marker, diff_style) = self.line_style(op.kind, styles);
+            let (line_bg, word_bg) = styles.tints(op.kind);
+            if let Some(bg) = line_bg {
+                surface.set_style(Rect::new(x, y, width as u16, 1), Style::default().bg(bg));
+            }
             let gutter = format!("{:>w$} {} ", line_idx + 1, marker, w = self.num_width);
-            let (text_x, _) = surface.set_stringn(
-                x,
-                y,
-                &gutter,
-                width,
-                if op.kind == OpKind::Context {
-                    styles.linenr
-                } else {
-                    style
-                },
-            );
+            let mut gutter_style = if op.kind == OpKind::Context {
+                styles.linenr
+            } else {
+                diff_style
+            };
+            if let Some(bg) = line_bg {
+                gutter_style = gutter_style.bg(bg);
+            }
+            let (text_x, _) = surface.set_stringn(x, y, &gutter, width, gutter_style);
             let text_width = width.saturating_sub((text_x - x) as usize);
             if let Some(line) = lines.get(line_idx) {
-                draw_code_line(
-                    surface,
-                    text_x,
-                    y,
-                    text_width,
-                    line,
-                    style,
-                    op.hl.as_ref(),
-                    style.add_modifier(Modifier::REVERSED),
-                    self.h_scroll,
-                );
+                let cs = self.code_style(file, op, old_side, line_idx, line_bg, word_bg, styles);
+                draw_code_line(surface, text_x, y, text_width, line, &cs, self.h_scroll);
             }
         };
 
